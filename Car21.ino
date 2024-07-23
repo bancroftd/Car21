@@ -24,6 +24,16 @@
 #include <string.h>
 #include <stdio.h> // for sscanf
 
+//Initial Wifi Settings Only, can be changed later in UI (currently not implimented, storing or retireving from EEPROM!!)
+String Hostname = "iPhone";
+String APPassword = "dudewhereismycar";
+
+//Pin Setup
+MCP_CAN CAN0(D1);                              // CAN0 interface usins CS on digital pin 2
+MCP_CAN CAN1(D3);                               // CAN1 interface using CS on digital pin 3
+#define CAN0_INT D4    //define interrupt pin for CAN0 recieve buffer
+#define CAN1_INT D2    //define interrupt pin for CAN1 recieve buffer
+
 
 extern const char   html_template[];
 extern const char   html_update[];
@@ -39,10 +49,9 @@ WebSocketsServer    webSocket = WebSocketsServer(8000);
 
 //Global Variables not saved to EEPROM
 int MessageRecording = 0; //When this is 1, all new messages are put into the hidden array.
-int OutputDatatoUI = 1;
+int OutputDatatoUI = 0;
 int OutputSerial = 0;
-String Hostname = "iPhone";
-String APPassword = "dudewhereismycar";
+
 byte numhideMessages = 0; // Number of messages currently in the array
 byte numblockedMessages = 0; // Number of messages currently in the array
 byte numMessageReplacements = 0; // Number of message replacements currently in the array
@@ -298,102 +307,8 @@ byte txBuf0[] = {0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55};
 byte txBuf1[] = {0x55,0xAA,0x55,0xAA,0x55,0xAA,0x55,0xAA};
 char msgString[128];                        // Array to store serial string
 
-MCP_CAN CAN0(D1);                              // CAN0 interface usins CS on digital pin 2
-MCP_CAN CAN1(D3);                               // CAN1 interface using CS on digital pin 3
-
-#define CAN0_INT D4    //define interrupt pin for CAN0 recieve buffer
-#define CAN1_INT D2    //define interrupt pin for CAN1 recieve buffer
 
 
-
-
-void setup() {
-  EEPROM.begin(44716);
-  Serial.begin(115200);
-  
-  //Check if flash is new, new flashes have -1 for thiw value, if so don't load from EEPROM and put OutputDatatoUI = 0
-  EEPROM.get(EEPROM_ADDR_OUTPUT_DATATOUI, OutputDatatoUI);
-  if (OutputDatatoUI == -1) {
-    OutputDatatoUI = 0;
-    OutputSerial = 0;
-    OutputDatatoUI = 0;
-    Hostname = "iPhone";
-    
-    APPassword = "dudewhereismycar";
-    StartUIServices = 1;    
-  } else {
-    loadglobalvariables();
-    loadHiddenMessagesFromEEPROM();
-    loadBlockedMessagesFromEEPROM();
-    loadMessageReplacementsFromEEPROM();
-    processoutputtoui("Config Loaded from EEPROM!");
-  }
-  
-
-  startAP(true);
-
-  // For update Web Page
-  //---------------------------------------
-  MDNS.begin(Hostname);
-    
-    server.on("/update", HTTP_POST, []() {
-      server.sendHeader("Connection", "close");
-      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-      ESP.restart();
-    }, []() {
-      HTTPUpload& upload = server.upload();
-      if (upload.status == UPLOAD_FILE_START) {
-        Serial.setDebugOutput(true);
-        WiFiUDP::stopAll();
-        Serial.printf("Update: %s\n", upload.filename.c_str());
-        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-        if (!Update.begin(maxSketchSpace)) { //start with max available size
-          Update.printError(Serial);
-        }
-      } else if (upload.status == UPLOAD_FILE_WRITE) {
-        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-          Update.printError(Serial);
-        }
-      } else if (upload.status == UPLOAD_FILE_END) {
-        if (Update.end(true)) { //true to set the size to the current progress
-          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-        } else {
-          Update.printError(Serial);
-        }
-        Serial.setDebugOutput(false);
-      }
-      yield();
-    });
-    MDNS.addService("http", "tcp", 80);
-    //--------------------------------------------------------------------------
-
-  startServer();
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
-
-  pinMode(CAN0_INT, INPUT_PULLUP);
-  pinMode(CAN1_INT, INPUT_PULLUP);
-  
-  // init CAN0 bus, baudrate: 250k@16MHz
-  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
-    Serial.print("CAN0: Init OK!\r\n");
-    CAN0.setMode(MCP_NORMAL);
-  } else {
-    Serial.print("CAN0: Init Fail!!!\r\n");
-  }
-  
-  // init CAN1 bus, baudrate: 250k@16MHz
-  if(CAN1.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
-    Serial.print("CAN1: Init OK!\r\n");
-    CAN1.setMode(MCP_NORMAL);
-  } else {
-    Serial.print("CAN1: Init Fail!!!\r\n");
-  }
-  
-  SPI.setClockDivider(SPI_CLOCK_DIV2);         // Set SPI to run at 8MHz (16MHz / 2 = 8 MHz)
-  
-  //timer.every(60000, print_message);
-}
 
 bool checkAndRecordMessage(byte rxBuf[]) {
   // Check if the message already exists in the hidemessages array
@@ -436,77 +351,6 @@ bool checkAndRecordMessage(byte rxBuf[]) {
   }
 }
 
-void loop() {  
-  server.handleClient();
-  MDNS.update();
-  webSocket.loop();
-
-  if(!digitalRead(CAN0_INT)) { // If interrupt pin is low, read CAN1 receive buffer
-    CAN0.readMsgBuf(&rxId, &len, rxBuf);       // Read data: len = data length, buf = data byte(s)
-    
-    if (!shouldBlockTransmission(rxBuf)) {
-      CAN1.sendMsgBuf(rxId, 1, len, rxBuf);
-      
-      if (!shouldHideTransmission(rxBuf)) {
-        if(OutputDatatoUI == 1) {
-          printWebMessage(rxId, len, rxBuf, "A");
-        }
-        
-        if(OutputSerial == 1) {
-          printMessage(rxId, len, rxBuf);
-        }
-      }
-      
-    }
-    else {
-
-      if(OutputDatatoUI == 1) {
-        printblockedWebMessage(rxId, len, rxBuf, "A");
-      }
-      
-      if(OutputSerial == 1) {
-        printblockedMessage(rxId, len, rxBuf);
-      }
-
-    }
-  }
-  
-  if(!digitalRead(CAN1_INT)) { // If interrupt pin is low, read CAN1 receive buffer
-    CAN1.readMsgBuf(&rxId, &len, rxBuf);       // Read data: len = data length, buf = data byte(s)
-        
-    //Lookups and transforms here:
-    replaceMessage(rxBuf);
-    
-    if (!shouldBlockTransmission(rxBuf)) {
-      CAN0.sendMsgBuf(rxId, 1, len, rxBuf);
-      
-      if(MessageRecording == 1) {
-        checkAndRecordMessage(rxBuf);
-      }
-
-      if (!shouldHideTransmission(rxBuf)) {
-        if(OutputDatatoUI == 1) {
-          printWebMessage(rxId, len, rxBuf, "B");
-        }
-        
-        if(OutputSerial == 1) {
-          printMessage(rxId, len, rxBuf);
-        }
-      }
-    }
-    else {
-    
-      if(OutputDatatoUI == 1) {
-        printblockedWebMessage(rxId, len, rxBuf, "B");
-      }
-      
-      if(OutputSerial == 1) {
-        printblockedMessage(rxId, len, rxBuf);
-      }
-
-    }
-  }
-}
 
 void replaceMessage(byte* receivedMessage) {
     // Iterate through the replacement array
@@ -1010,4 +854,178 @@ bool validateString(String str, int len) {
 
   // String meets all criteria
   return true;
+}
+
+void setup() {
+  EEPROM.begin(44716);
+  Serial.begin(115200);
+  
+  //Check if flash is new, new flashes have -1 for thiw value, if so don't load from EEPROM and put OutputDatatoUI = 0
+  EEPROM.get(EEPROM_ADDR_OUTPUT_DATATOUI, OutputDatatoUI);
+  if (OutputDatatoUI == -1) {
+    OutputDatatoUI = 0;
+    OutputSerial = 0;
+    OutputDatatoUI = 0;
+    StartUIServices = 1;    
+  } else {
+    loadglobalvariables();
+    loadHiddenMessagesFromEEPROM();
+    loadBlockedMessagesFromEEPROM();
+    loadMessageReplacementsFromEEPROM();
+    processoutputtoui("Config Loaded from EEPROM!");
+  }
+  
+
+  startAP(true);
+
+  // For update Web Page
+  //---------------------------------------
+  MDNS.begin(Hostname);
+    
+    server.on("/update", HTTP_POST, []() {
+      server.sendHeader("Connection", "close");
+      server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+      ESP.restart();
+    }, []() {
+      HTTPUpload& upload = server.upload();
+      if (upload.status == UPLOAD_FILE_START) {
+        Serial.setDebugOutput(true);
+        WiFiUDP::stopAll();
+        Serial.printf("Update: %s\n", upload.filename.c_str());
+        uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+        if (!Update.begin(maxSketchSpace)) { //start with max available size
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_WRITE) {
+        if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+          Update.printError(Serial);
+        }
+      } else if (upload.status == UPLOAD_FILE_END) {
+        if (Update.end(true)) { //true to set the size to the current progress
+          Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+        } else {
+          Update.printError(Serial);
+        }
+        Serial.setDebugOutput(false);
+      }
+      yield();
+    });
+    MDNS.addService("http", "tcp", 80);
+    //--------------------------------------------------------------------------
+
+  startServer();
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+
+
+  pinMode(CAN0_INT, INPUT_PULLUP);
+  pinMode(CAN1_INT, INPUT_PULLUP);
+  
+  // init CAN0 bus, baudrate: 250k@16MHz
+  if(CAN0.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
+    Serial.print("CAN0: Init OK!\r\n");
+    CAN0.setMode(MCP_NORMAL);
+  } else {
+    Serial.print("CAN0: Init Fail!!!\r\n");
+  }
+  
+  // init CAN1 bus, baudrate: 250k@16MHz
+  if(CAN1.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
+    Serial.print("CAN1: Init OK!\r\n");
+    CAN1.setMode(MCP_NORMAL);
+  } else {
+    Serial.print("CAN1: Init Fail!!!\r\n");
+  }
+  
+  SPI.setClockDivider(SPI_CLOCK_DIV2);         // Set SPI to run at 8MHz (16MHz / 2 = 8 MHz)
+  
+  //timer.every(60000, print_message);
+}
+
+
+void loop() {  
+  server.handleClient();
+  MDNS.update();
+  webSocket.loop();
+
+  if(!digitalRead(CAN0_INT)) { // If interrupt pin is low, read CAN1 receive buffer
+    CAN0.readMsgBuf(&rxId, &len, rxBuf);       // Read data: len = data length, buf = data byte(s)
+    //if ((rxId & 0x80000000) == 0x80000000)           // Determine if ID is standard (11 bits) or extended (29 bits)
+      //sprintf(msgString, "Extended ID: 0x%.8lX  DLC: %1d  Data:", (rxId & 0x1FFFFFFF), len);
+    //else
+    //  sprintf(msgString, "Standard ID: 0x%.3lX       DLC: %1d  Data:", rxId, len);
+    
+
+    if (!shouldBlockTransmission(rxBuf)) {
+      CAN1.sendMsgBuf(rxId, 1, len, rxBuf);
+      
+      if (!shouldHideTransmission(rxBuf)) {
+        if(OutputDatatoUI == 1) {
+          printWebMessage(rxId, len, rxBuf, "A");
+        }
+        
+        if(OutputSerial == 1) {
+          printMessage(rxId, len, rxBuf);
+        }
+      }
+      
+    }
+    else {
+
+      if(OutputDatatoUI == 1) {
+        //printWebMessage(rxId, len, rxBuf, "B");
+        printWebMessage(rxId, len, rxBuf, msgString);
+      }
+      
+      if(OutputSerial == 1) {
+        printblockedMessage(rxId, len, rxBuf);
+      }
+
+    }
+  }
+  
+  if(!digitalRead(CAN1_INT)) { // If interrupt pin is low, read CAN1 receive buffer
+    CAN1.readMsgBuf(&rxId, &len, rxBuf);       // Read data: len = data length, buf = data byte(s)
+    
+    //if ((rxId & 0x80000000) == 0x80000000)           // Determine if ID is standard (11 bits) or extended (29 bits)
+    //  sprintf(msgString, "Extended ID: 0x%.8lX  DLC: %1d  Data:", (rxId & 0x1FFFFFFF), len);
+    //else
+    //  sprintf(msgString, "Standard ID: 0x%.3lX       DLC: %1d  Data:", rxId, len);
+    
+        
+    //Lookups and transforms here:
+    replaceMessage(rxBuf);
+    
+    if (!shouldBlockTransmission(rxBuf)) {
+      CAN0.sendMsgBuf(rxId, 1, len, rxBuf);
+      
+      if(MessageRecording == 1) {
+        checkAndRecordMessage(rxBuf);
+      }
+
+      if (!shouldHideTransmission(rxBuf)) {
+        if(OutputDatatoUI == 1) {
+          //Serial.print(printWebMessage);
+          printWebMessage(rxId, len, rxBuf, "B");
+          //printWebMessage(rxId, len, rxBuf, msgString);
+          
+        }
+        
+        if(OutputSerial == 1) {
+          printMessage(rxId, len, rxBuf);
+        }
+      }
+    }
+    else {
+    
+      if(OutputDatatoUI == 1) {
+        printblockedWebMessage(rxId, len, rxBuf, "B");
+      }
+      
+      if(OutputSerial == 1) {
+        printblockedMessage(rxId, len, rxBuf);
+      }
+
+    }
+  }
 }
